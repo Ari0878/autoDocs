@@ -1,6 +1,10 @@
 from pathlib import Path
 from datetime import datetime
+import io
 import re
+import base64
+import mimetypes
+import subprocess
 
 EXPORT_BASE = Path('./exports')
 
@@ -15,37 +19,95 @@ class DocumentExporter:
     def to_markdown(self) -> str:
         return self.docs.get('full_markdown', '# Sin documentación generada')
 
+    def _markdown_table_to_html(self, text: str) -> str:
+        lines = text.split('\n')
+        output = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if '|' in line and i + 1 < len(lines):
+                sep_line = lines[i + 1]
+                if re.match(r'^\s*\|?\s*(:?-+:?\s*\|)+\s*(:?-+:?\s*)?\|?\s*$', sep_line):
+                    headers = [cell.strip() for cell in re.split(r'\s*\|\s*', line.strip().strip('|'))]
+                    rows = []
+                    i += 2
+                    while i < len(lines) and '|' in lines[i] and lines[i].strip():
+                        row_cells = [cell.strip() for cell in re.split(r'\s*\|\s*', lines[i].strip().strip('|'))]
+                        if len(row_cells) == len(headers):
+                            rows.append(row_cells)
+                        i += 1
+                    head_html = ''.join(f'<th>{h}</th>' for h in headers)
+                    body_html = ''.join('<tr>' + ''.join(f'<td>{c}</td>' for c in row) + '</tr>' for row in rows)
+                    output.append(f'<table class="report-table"><thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody></table>')
+                    continue
+            output.append(line)
+            i += 1
+        return '\n'.join(output)
+
+    def _render_markdown_with_node(self, md: str) -> str:
+        script_path = Path(__file__).resolve().parents[1] / 'markdown_to_html.js'
+        if not script_path.exists():
+            raise FileNotFoundError('Node markdown script not found')
+        result = subprocess.run(
+            ['node', str(script_path)],
+            input=md,
+            text=True,
+            capture_output=True,
+            cwd=script_path.parent,
+            timeout=30
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Node markdown conversion failed: {result.stderr.strip()}")
+        return result.stdout
+
     def to_html(self) -> str:
         md = self.to_markdown()
         project_name = self.project.get('name', 'Proyecto')
 
-        html_body = md
-        html_body = re.sub(r'^#### (.+)$', r'<h4>\1</h4>', html_body, flags=re.MULTILINE)
-        html_body = re.sub(r'^### (.+)$',  r'<h3>\1</h3>', html_body, flags=re.MULTILINE)
-        html_body = re.sub(r'^## (.+)$',   r'<h2>\1</h2>', html_body, flags=re.MULTILINE)
-        html_body = re.sub(r'^# (.+)$',    r'<h1>\1</h1>', html_body, flags=re.MULTILINE)
-        html_body = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html_body)
-        html_body = re.sub(r'\*(.+?)\*',      r'<em>\1</em>',        html_body)
-        html_body = re.sub(r'`([^`]+)`', r'<code>\1</code>', html_body)
-        html_body = re.sub(r'```[\w]*\n(.*?)```', r'<pre><code>\1</code></pre>', html_body, flags=re.DOTALL)
+        try:
+            html_body = self._render_markdown_with_node(md)
+        except Exception:
+            try:
+                from markdown import markdown as markdown_to_html
+                html_body = markdown_to_html(md, extensions=['fenced_code', 'tables', 'attr_list', 'sane_lists', 'extra'])
+            except Exception:
+                html_body = md
+                html_body = re.sub(r'^#### (.+)$', r'<h4>\1</h4>', html_body, flags=re.MULTILINE)
+                html_body = re.sub(r'^### (.+)$',  r'<h3>\1</h3>', html_body, flags=re.MULTILINE)
+                html_body = re.sub(r'^## (.+)$',   r'<h2>\1</h2>', html_body, flags=re.MULTILINE)
+                html_body = re.sub(r'^# (.+)$',    r'<h1>\1</h1>', html_body, flags=re.MULTILINE)
+                html_body = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', html_body)
+                html_body = re.sub(r'\*(.+?)\*',      r'<em>\1</em>',        html_body)
+                html_body = re.sub(r'`([^`]+)`', r'<code>\1</code>', html_body)
+                html_body = re.sub(r'```[\w]*\n(.*?)```', r'<pre><code>\1</code></pre>', html_body, flags=re.DOTALL)
+                html_body = html_body.replace('---', '<hr>')
+                html_body = self._markdown_table_to_html(html_body)
 
-        def convert_table(m):
-            rows = m.group(0).strip().split('\n')
-            out = '<table>\n'
-            for i, row in enumerate(rows):
-                if re.match(r'\|[-| :]+\|', row):
-                    continue
-                cells = [c.strip() for c in row.split('|') if c.strip()]
-                tag = 'th' if i == 0 else 'td'
-                out += '<tr>' + ''.join(f'<{tag}>{c}</{tag}>' for c in cells) + '</tr>\n'
-            return out + '</table>\n'
-        html_body = re.sub(r'(\|.+\|\n)+', convert_table, html_body)
-        html_body = re.sub(r'^> (.+)$', r'<blockquote>\1</blockquote>', html_body, flags=re.MULTILINE)
-        html_body = re.sub(r'^\- (.+)$', r'<li>\1</li>', html_body, flags=re.MULTILINE)
-        html_body = re.sub(r'(<li>.*?</li>\n?)+', r'<ul>\g<0></ul>', html_body, flags=re.DOTALL)
-        html_body = html_body.replace('---', '<hr>')
-        html_body = re.sub(r'\n\n+', '</p><p>', html_body)
-        html_body = '<p>' + html_body + '</p>'
+        html_body = re.sub(r'<table(?![^>]*class=)', '<table class="report-table"', html_body)
+
+        def image_replacer(match):
+            attrs = match.group(1)
+            src = match.group(2)
+            if src.startswith('http://') or src.startswith('https://') or src.startswith('data:'):
+                resolved_src = src
+            else:
+                try:
+                    image_path = Path(src)
+                    if not image_path.is_absolute():
+                        image_path = Path.cwd() / image_path
+                    if not image_path.exists():
+                        image_path = EXPORT_BASE / image_path.name
+                    if image_path.exists():
+                        mime_type = mimetypes.guess_type(str(image_path))[0] or 'image/png'
+                        encoded = base64.b64encode(image_path.read_bytes()).decode('ascii')
+                        resolved_src = f'data:{mime_type};base64,{encoded}'
+                    else:
+                        resolved_src = src
+                except Exception:
+                    resolved_src = src
+            return f'<img src="{resolved_src}" {attrs} style="max-width: 100%; height: auto; margin: 1rem 0; border: 1px solid var(--border); border-radius: 8px;">'
+
+        html_body = re.sub(r'<img\s+([^>]*?)src=["\']([^"\']+)["\']([^>]*)>', image_replacer, html_body)
 
         score = self.results.get('quality_score', 0)
         score_color = '#10b981' if score >= 70 else '#f59e0b' if score >= 40 else '#ef4444'
@@ -86,6 +148,12 @@ class DocumentExporter:
   pre {{ background: #0d1b2a; border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem; overflow-x: auto; margin: 1rem 0; }}
   pre code {{ background: none; border: none; padding: 0; color: #a8d8f0; font-size: 0.85rem; }}
   table {{ width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.9rem; }}
+  .report-table {{ width: 100%; border-collapse: collapse; margin: 1.2rem 0; font-size: 0.95rem; }}
+  .report-table thead tr {{ background: rgba(56,189,248,0.08); }}
+  .report-table th, .report-table td {{ padding: 0.85rem 1rem; border: 1px solid var(--border); }}
+  .report-table th {{ color: var(--white); text-align: left; font-weight: 700; background: rgba(15,23,42,0.95); }}
+  .report-table tr:nth-child(even) td {{ background: rgba(255,255,255,0.03); }}
+  .report-table td {{ color: var(--text); }}
   th {{ background: var(--surface); color: var(--white); padding: 0.7rem 1rem; text-align: left; font-weight: 600; border: 1px solid var(--border); }}
   td {{ padding: 0.6rem 1rem; border: 1px solid var(--border); color: var(--text); }}
   tr:nth-child(even) td {{ background: rgba(255,255,255,0.02); }}
@@ -139,7 +207,14 @@ class DocumentExporter:
 </body>
 </html>"""
 
-    # ── PDF: WeasyPrint → ReportLab → HTML fallback ──────────────────────────
+    def _is_valid_pdf(self, path: Path) -> bool:
+        try:
+            with path.open('rb') as f:
+                return f.read(4) == b'%PDF'
+        except Exception:
+            return False
+
+    # ── PDF: ReportLab → WeasyPrint → HTML fallback ──────────────────────────
     def to_pdf(self) -> str:
         html_content = self.to_html()
         output_path = EXPORT_BASE / f"{self.project['_id']}_docs.pdf"
@@ -148,30 +223,34 @@ class DocumentExporter:
         # Always save HTML as backup
         html_path.write_text(html_content, encoding='utf-8')
 
-        # 1st attempt: WeasyPrint (best visual quality)
+        # 1st attempt: WeasyPrint (preserves HTML tables and formatting)
         try:
             from weasyprint import HTML
-            HTML(string=html_content).write_pdf(str(output_path))
-            if output_path.exists() and output_path.stat().st_size > 1000:
+            HTML(string=html_content, base_url=str(EXPORT_BASE.resolve())).write_pdf(str(output_path))
+            if output_path.exists() and output_path.stat().st_size > 1000 and self._is_valid_pdf(output_path):
                 print(f"[PDF] WeasyPrint generado exitosamente: {output_path.stat().st_size} bytes")
                 return str(output_path)
             else:
                 print(f"[PDF] WeasyPrint generó archivo inválido o muy pequeño")
+                output_path.unlink(missing_ok=True)
         except Exception as e:
             print(f"[PDF] Error en WeasyPrint: {str(e)}")
+            output_path.unlink(missing_ok=True)
 
-        # 2nd attempt: ReportLab (always works, no system deps)
+        # 2nd attempt: ReportLab (fallback when HTML rendering fails)
         try:
             pdf_path = self._pdf_with_reportlab(str(output_path))
-            if pdf_path and Path(pdf_path).exists() and Path(pdf_path).stat().st_size > 1000:
-                print(f"[PDF] ReportLab generado exitosamente: {Path(pdf_path).stat().st_size} bytes")
+            pdf_obj = Path(pdf_path)
+            if pdf_path and pdf_obj.exists() and pdf_obj.stat().st_size > 1000 and self._is_valid_pdf(pdf_obj):
+                print(f"[PDF] ReportLab generado exitosamente: {pdf_obj.stat().st_size} bytes")
                 return pdf_path
             else:
                 print(f"[PDF] ReportLab generó archivo inválido o muy pequeño")
+                pdf_obj.unlink(missing_ok=True)
         except Exception as e:
             print(f"[PDF] Error en ReportLab: {str(e)}")
 
-        # Final fallback: HTML (but rename to .pdf to avoid confusion)
+        # Final fallback
         print(f"[PDF] Ambos métodos fallaron, usando HTML como fallback")
         return str(html_path)
 
@@ -293,17 +372,112 @@ class DocumentExporter:
                 except Exception:
                     story.append(Paragraph(re.sub(r'<[^>]+>', '', text), style))
 
-        for line in md.split('\n'):
+        def add_pdf_image_from_html(line):
+            img_tags = re.findall(r'<img[^>]*src=["\']([^"\']+)["\'][^>]*>', line)
+            if not img_tags:
+                return False
+
+            from reportlab.platypus import Image as RLImage
+            for src in img_tags:
+                if src.startswith('data:'):
+                    try:
+                        header, payload = src.split(',', 1)
+                        data = base64.b64decode(payload)
+                        image_file = io.BytesIO(data)
+                        img = RLImage(image_file, width=15*cm)
+                        img.hAlign = 'CENTER'
+                        story.append(img)
+                        story.append(Spacer(1, 0.4*cm))
+                    except Exception:
+                        story.append(Paragraph('Imagen no disponible', styles['body']))
+                else:
+                    try:
+                        image_path = Path(src)
+                        if not image_path.is_absolute():
+                            image_path = Path.cwd() / image_path
+                        if image_path.exists():
+                            img = RLImage(str(image_path), width=15*cm)
+                            img.hAlign = 'CENTER'
+                            story.append(img)
+                            story.append(Spacer(1, 0.4*cm))
+                        else:
+                            story.append(Paragraph('Imagen no encontrada: ' + src, styles['body']))
+                    except Exception:
+                        story.append(Paragraph('Imagen no disponible', styles['body']))
+            return True
+
+        def parse_table(lines, start_index):
+            if start_index + 1 >= len(lines):
+                return None
+            header_line = lines[start_index].strip()
+            sep_line = lines[start_index + 1].strip()
+            if '|' not in header_line or not re.match(r'^\s*\|?\s*(:?-+:?\s*\|)+\s*(:?-+:?\s*)?\|?\s*$', sep_line):
+                return None
+
+            headers = [cell.strip() for cell in re.split(r'\s*\|\s*', header_line.strip().strip('|'))]
+            rows = []
+            index = start_index + 2
+            while index < len(lines):
+                line = lines[index].strip()
+                if not line or '|' not in line:
+                    break
+                row_cells = [cell.strip() for cell in re.split(r'\s*\|\s*', line.strip().strip('|'))]
+                if len(row_cells) == len(headers):
+                    rows.append(row_cells)
+                else:
+                    break
+                index += 1
+
+            if not rows:
+                return None
+
+            data = [headers] + rows
+            return data, index - start_index
+
+        lines = md.split('\n')
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx]
             if line.strip().startswith('```'):
                 if in_code:
                     flush_code()
                     in_code = False
                 else:
                     in_code = True
+                idx += 1
                 continue
             if in_code:
                 code_buf.append(line)
+                idx += 1
                 continue
+
+            table_result = parse_table(lines, idx)
+            if table_result:
+                table_data, consumed = table_result
+                tbl = Table(table_data, colWidths=[None] * len(table_data[0]))
+                tbl.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e293b')),
+                    ('TEXTCOLOR',  (0, 0), (-1, 0), colors.white),
+                    ('ALIGN',      (0, 0), (-1, -1), 'LEFT'),
+                    ('VALIGN',     (0, 0), (-1, -1), 'MIDDLE'),
+                    ('INNERGRID',  (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+                    ('BOX',        (0, 0), (-1, -1), 0.5, colors.HexColor('#e2e8f0')),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8fafc')),
+                    ('TEXTCOLOR',  (0, 1), (-1, -1), colors.HexColor('#334155')),
+                    ('FONTNAME',   (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTNAME',   (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE',   (0, 0), (-1, 0), 10),
+                    ('FONTSIZE',   (0, 1), (-1, -1), 9),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                    ('RIGHTPADDING',(0, 0), (-1, -1), 6),
+                    ('TOPPADDING',  (0, 0), (-1, -1), 4),
+                    ('BOTTOMPADDING',(0, 0), (-1, -1), 4),
+                ]))
+                story.append(tbl)
+                story.append(Spacer(1, 0.3*cm))
+                idx += consumed
+                continue
+
             if line.strip() == '---':
                 story.append(HRFlowable(width="100%", thickness=0.5,
                                         color=colors.HexColor('#e2e8f0')))
@@ -322,8 +496,12 @@ class DocumentExporter:
                 safe_para('• ' + line[2:], styles['body'])
             elif line.strip() == '':
                 story.append(Spacer(1, 0.15*cm))
+            elif add_pdf_image_from_html(line):
+                idx += 1
+                continue
             else:
                 safe_para(line, styles['body'])
+            idx += 1
 
         if in_code:
             flush_code()

@@ -102,13 +102,16 @@ class ProjectAnalyzer:
             dirs[:] = [d for d in dirs if d not in self.IGNORE_DIRS]
             rel_root = Path(root).relative_to(self.project_path)
             for fname in files:
+                full_path = Path(root) / fname
                 ext = Path(fname).suffix.lower()
                 lang = self.LANGUAGE_EXTENSIONS.get(ext)
+                if not lang and full_path.exists():
+                    lang = self._guess_language_by_shebang(full_path)
                 if lang:
                     lang_count[lang] += 1
                     total += 1
                 try:
-                    size = os.path.getsize(Path(root) / fname)
+                    size = os.path.getsize(full_path)
                 except OSError:
                     size = 0
                 structure.append({
@@ -127,6 +130,32 @@ class ProjectAnalyzer:
             self.results["primary_language"] = max(langs, key=langs.get)
         elif self.results["languages"]:
             self.results["primary_language"] = max(self.results["languages"], key=self.results["languages"].get)
+
+    def _guess_language_by_shebang(self, filepath: Path):
+        try:
+            first_line = filepath.read_text(encoding='utf-8', errors='ignore').splitlines()[0].strip()
+        except Exception:
+            return None
+        if first_line.startswith('#!'):
+            if 'python' in first_line:
+                return 'Python'
+            if 'node' in first_line or 'nodejs' in first_line:
+                return 'JavaScript'
+            if 'bash' in first_line or 'sh' in first_line:
+                return 'Shell'
+            if 'ruby' in first_line:
+                return 'Ruby'
+            if 'perl' in first_line:
+                return 'Perl'
+            if 'php' in first_line:
+                return 'PHP'
+            if 'lua' in first_line:
+                return 'Lua'
+            if 'dart' in first_line:
+                return 'Dart'
+            if 'pwsh' in first_line or 'powershell' in first_line:
+                return 'PowerShell'
+        return None
 
     def _analyze_code_files(self):
         dispatch = {

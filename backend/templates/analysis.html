@@ -376,17 +376,25 @@
       });
     }
 
+    async function downloadFile(url, filename, mime) {
+      const res = await fetch(url, { headers: jsonHeaders() });
+      if (!res.ok) {
+        const errorText = await res.text();
+        console.error('Error descargando archivo:', errorText);
+        return;
+      }
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
     async function exportMd() {
-      const res = await fetch(`/api/export/${projectId}/markdown`, { headers: jsonHeaders() });
-      const data = await res.json();
-      const blob = new Blob([data.content], {type:'text/markdown'});
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = data.filename; a.click();
+      await downloadFile(`/api/export/${projectId}/markdown`, `docs_${projectId}.md`, 'text/markdown');
     }
     async function exportHtml() {
-      const res = await fetch(`/api/export/${projectId}/html`, { headers: jsonHeaders() });
-      const data = await res.json();
-      const blob = new Blob([data.content], {type:'text/html'});
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = data.filename; a.click();
+      await downloadFile(`/api/export/${projectId}/html`, `docs_${projectId}.html`, 'text/html');
     }
     async function exportPdf() {
       window.open(`/api/export/${projectId}/pdf?token=${token}`, '_blank');

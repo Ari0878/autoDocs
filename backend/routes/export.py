@@ -3,7 +3,9 @@ from flask_jwt_extended import jwt_required, get_jwt_identity, verify_jwt_in_req
 from flask_jwt_extended.exceptions import JWTExtendedException
 from services.db import get_db
 from services.exporter import DocumentExporter
+from services.doc_generator import DocGenerator
 import os
+import traceback
 
 export_bp = Blueprint('export', __name__)
 
@@ -38,31 +40,41 @@ def export_pdf(project_id):
     if not result:
         return jsonify({"error": "Sin resultados de análisis"}), 404
 
-    exporter = DocumentExporter(project, result)
-    file_path = exporter.to_pdf()
+    try:
+        if result.get('results'):
+            documentation = DocGenerator(result['results']).generate()
+            db.analysis_results.update_one({"project_id": project_id}, {"$set": {"documentation": documentation}})
+            exporter = DocumentExporter(project, {"results": result['results'], "documentation": documentation})
+        else:
+            exporter = DocumentExporter(project, result)
+        file_path = exporter.to_pdf()
 
-    # Verificar que el archivo existe y tenga contenido
-    from pathlib import Path
-    path_obj = Path(file_path)
-    if not path_obj.exists() or path_obj.stat().st_size < 100:
-        return jsonify({"error": "Error al generar PDF - archivo inválido"}), 500
+        # Verificar que el archivo existe y tenga contenido
+        from pathlib import Path
+        path_obj = Path(file_path)
+        if not path_obj.exists() or path_obj.stat().st_size < 100:
+            raise RuntimeError("Archivo generado no existe o es demasiado pequeño")
 
-    # Si el archivo es HTML (fallback), enviar como HTML con advertencia
-    if file_path.endswith('.html'):
-        print(f"[Export] PDF falló, enviando HTML como fallback")
+        # Si el archivo es HTML (fallback), enviar como HTML con advertencia
+        if file_path.endswith('.html'):
+            print(f"[Export] PDF falló, enviando HTML como fallback")
+            return send_file(
+                file_path,
+                as_attachment=True,
+                download_name=f"{project['name']}_documentacion.html",
+                mimetype='text/html'
+            )
+
         return send_file(
             file_path,
             as_attachment=True,
-            download_name=f"{project['name']}_documentacion.html",
-            mimetype='text/html'
+            download_name=f"{project['name']}_documentacion.pdf",
+            mimetype='application/pdf'
         )
-
-    return send_file(
-        file_path,
-        as_attachment=True,
-        download_name=f"{project['name']}_documentacion.pdf",
-        mimetype='application/pdf'
-    )
+    except Exception as exc:
+        error_text = traceback.format_exc()
+        print(f"[Export] Error al generar PDF para proyecto {project_id}: {exc}\n{error_text}")
+        return jsonify({"error": "Error interno al generar PDF", "details": str(exc)}), 500
 
 @export_bp.route('/<project_id>/html', methods=['GET'])
 def export_html(project_id):
@@ -79,7 +91,12 @@ def export_html(project_id):
     if not result:
         return jsonify({"error": "Sin resultados de análisis"}), 404
 
-    exporter = DocumentExporter(project, result)
+    if result.get('results'):
+        documentation = DocGenerator(result['results']).generate()
+        db.analysis_results.update_one({"project_id": project_id}, {"$set": {"documentation": documentation}})
+        exporter = DocumentExporter(project, {"results": result['results'], "documentation": documentation})
+    else:
+        exporter = DocumentExporter(project, result)
     html = exporter.to_html()
 
     return Response(
@@ -103,7 +120,12 @@ def export_markdown(project_id):
     if not result:
         return jsonify({"error": "Sin resultados de análisis"}), 404
 
-    exporter = DocumentExporter(project, result)
+    if result.get('results'):
+        documentation = DocGenerator(result['results']).generate()
+        db.analysis_results.update_one({"project_id": project_id}, {"$set": {"documentation": documentation}})
+        exporter = DocumentExporter(project, {"results": result['results'], "documentation": documentation})
+    else:
+        exporter = DocumentExporter(project, result)
     md = exporter.to_markdown()
 
     return Response(

@@ -1,5 +1,14 @@
 from datetime import datetime
 from services.ai_enhancer import AIEnhancer
+import subprocess
+import os
+import shutil
+import zlib
+import base64
+import mimetypes
+import urllib.request
+import urllib.error
+from pathlib import Path
 
 class DocGenerator:
     """
@@ -19,6 +28,220 @@ class DocGenerator:
         # Mejorar documentación con IA si está disponible
         if self.ai_enhancer.is_available():
             self.r = self.ai_enhancer.enhance_documentation(self.r)
+
+    def _render_markdown_table(self, headers: list[str], rows: list[list[str]]) -> str:
+        header_line = '| ' + ' | '.join(headers) + ' |'
+        separator_line = '| ' + ' | '.join('---' for _ in headers) + ' |'
+        row_lines = '\n'.join('| ' + ' | '.join(row) + ' |' for row in rows)
+        return f"{header_line}\n{separator_line}\n{row_lines}\n"
+
+    def _graphviz_available(self) -> bool:
+        return bool(shutil.which('dot'))
+
+    def _get_plantuml_command(self, temp_file: Path, output_dir: Path):
+        if not self._graphviz_available():
+            return []
+
+        jar_path = os.environ.get('PLANTUML_JAR_PATH')
+        if jar_path and Path(jar_path).exists():
+            return ['java', '-jar', str(Path(jar_path)), '-tpng', str(temp_file), '-o', str(output_dir)]
+
+        # Buscar JAR en rutas comunes
+        candidates = [
+            Path.cwd() / 'plantuml.jar',
+            Path.cwd().parent / 'plantuml.jar',
+            Path(__file__).resolve().parents[1] / 'plantuml.jar',
+            Path('/usr/local/bin/plantuml.jar'),
+            Path('C:/plantuml/plantuml.jar'),
+            Path('C:/Program Files/PlantUML/plantuml.jar'),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return ['java', '-jar', str(candidate), '-tpng', str(temp_file), '-o', str(output_dir)]
+
+        plantuml_bin = shutil.which('plantuml')
+        if plantuml_bin:
+            return [plantuml_bin, '-tpng', str(temp_file), '-o', str(output_dir)]
+
+        return []
+
+    def _encode6(self, v: int) -> str:
+        alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_'
+        return alphabet[v & 0x3F]
+
+    def _plantuml_encode(self, text: str) -> str:
+        compressed = zlib.compress(text.encode('utf-8'))
+        compressed = compressed[2:-4]
+        res = ''
+        i = 0
+        while i < len(compressed):
+            if i + 2 < len(compressed):
+                b1, b2, b3 = compressed[i], compressed[i+1], compressed[i+2]
+                res += self._encode6(b1 >> 2)
+                res += self._encode6(((b1 & 0x3) << 4) | (b2 >> 4))
+                res += self._encode6(((b2 & 0xF) << 2) | (b3 >> 6))
+                res += self._encode6(b3 & 0x3F)
+                i += 3
+            elif i + 1 < len(compressed):
+                b1, b2 = compressed[i], compressed[i+1]
+                res += self._encode6(b1 >> 2)
+                res += self._encode6(((b1 & 0x3) << 4) | (b2 >> 4))
+                res += self._encode6((b2 & 0xF) << 2)
+                i += 2
+            else:
+                b1 = compressed[i]
+                res += self._encode6(b1 >> 2)
+                res += self._encode6((b1 & 0x3) << 4)
+                i += 1
+        return res
+
+    def _fetch_plantuml_image(self, plantuml_code: str, output_file: Path) -> Path | None:
+        default_servers = [
+            'https://www.plantuml.com/plantuml',
+        ]
+        server_url = os.environ.get('PLANTUML_SERVER_URL')
+        servers = [server_url] + default_servers if server_url else default_servers
+        encoded = self._plantuml_encode(plantuml_code)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept': 'image/png,*/*;q=0.8',
+        }
+        for server in filter(None, servers):
+            for path_variant in ['png', 'svg']:
+                ext = 'png' if path_variant == 'png' else 'svg'
+                target_url = f"{server.rstrip('/')}/{path_variant}/{encoded}"
+                output_path = output_file.with_suffix(f'.{ext}')
+                try:
+                    request = urllib.request.Request(target_url, headers=headers)
+                    with urllib.request.urlopen(request, timeout=20) as response:
+                        if response.status != 200:
+                            print(f"[PlantUML Error] remote server returned {response.status} for {target_url}")
+                            continue
+                        content = response.read()
+                        content_type = response.headers.get('Content-Type', '')
+                        if ext == 'png':
+                            if not content.startswith(b'\x89PNG\r\n\x1a\n'):
+                                print(f"[PlantUML Error] remote server returned invalid PNG for {target_url}")
+                                continue
+                        elif ext == 'svg':
+                            text = content.decode('utf-8', errors='ignore').strip()
+                            if not (text.startswith('<svg') or text.startswith('<?xml')):
+                                print(f"[PlantUML Error] remote server returned invalid SVG for {target_url}")
+                                continue
+                        output_path.write_bytes(content)
+                        if self._is_valid_image(output_path):
+                            return output_path
+                        output_path.unlink(missing_ok=True)
+                except urllib.error.HTTPError as e:
+                    print(f"[PlantUML Error] remote fetch failed {e.code} for {target_url}: {e.reason}")
+                except urllib.error.URLError as e:
+                    print(f"[PlantUML Error] remote fetch failed for {target_url}: {e}")
+                except Exception as e:
+                    print(f"[PlantUML Error] remote fetch failed for {target_url}: {e}")
+        return None
+
+    def _image_to_data_uri(self, image_path: Path) -> str:
+        try:
+            if not self._is_valid_image(image_path):
+                return ""
+            data = image_path.read_bytes()
+            mime_type = mimetypes.guess_type(str(image_path))[0] or 'application/octet-stream'
+            encoded = base64.b64encode(data).decode('ascii')
+            return f'data:{mime_type};base64,{encoded}'
+        except Exception as e:
+            print(f"[PlantUML Error] failed to encode image to data URI: {e}")
+            return ""
+
+    def _is_valid_image(self, image_path: Path) -> bool:
+        try:
+            data = image_path.read_bytes()
+            suffix = image_path.suffix.lower()
+            if suffix == '.png':
+                if not data.startswith(b'\x89PNG\r\n\x1a\n') or len(data) <= 200:
+                    return False
+            elif suffix == '.svg':
+                text = data.decode('utf-8', errors='ignore').strip()
+                if not (text.startswith('<svg') or text.startswith('<?xml')):
+                    return False
+            if self._contains_plantuml_error_text(data):
+                print(f"[PlantUML Error] detected PlantUML error image content in {image_path}")
+                return False
+            return True
+        except Exception as e:
+            print(f"[PlantUML Error] image validation failed: {e}")
+            return False
+
+    def _contains_plantuml_error_text(self, data: bytes) -> bool:
+        lower = data.lower()
+        error_markers = [
+            b'dot executable',
+            b'cannot find graphviz',
+            b'graphviz not found',
+            b'failed to load graphviz',
+            b'error while running dot',
+            b'you should try',
+            b'plantuml error',
+            b'cannot find graphviz',
+        ]
+        return any(marker in lower for marker in error_markers)
+
+    def _generate_plantuml_diagram(self, plantuml_code: str, output_dir: str = "./exports") -> str:
+        """Genera un diagrama PlantUML y devuelve una URI de imagen o ruta de archivo."""
+        try:
+            output_dir_path = Path(output_dir).resolve()
+            output_dir_path.mkdir(parents=True, exist_ok=True)
+            
+            temp_name = f"temp_{os.getpid()}"
+            temp_file = output_dir_path / f"{temp_name}.puml"
+            temp_file.write_text(plantuml_code, encoding='utf-8')
+            
+            cmd = self._get_plantuml_command(temp_file, output_dir_path)
+            if cmd:
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    capture_output=True,
+                    text=True
+                )
+                stderr = (result.stderr or '').lower()
+                stdout = (result.stdout or '').lower()
+                plantuml_failures = [
+                    'cannot find graphviz',
+                    'dot executable',
+                    'graphviz not found',
+                    'failed to load graphviz',
+                    'error while running dot',
+                    'dot executable does not exist',
+                ]
+                has_dot_error = any(keyword in stderr for keyword in plantuml_failures) or any(keyword in stdout for keyword in plantuml_failures)
+                if result.returncode == 0 and not has_dot_error:
+                    temp_file.unlink(missing_ok=True)
+                    output_path = output_dir_path / f"{temp_name}.png"
+                    if output_path.exists() and self._is_valid_image(output_path):
+                        return self._image_to_data_uri(output_path)
+                    for f in output_dir_path.glob(f"{temp_name}*.png"):
+                        if self._is_valid_image(f):
+                            return self._image_to_data_uri(f)
+                else:
+                    print(f"[PlantUML Error] local command failed: returncode={result.returncode}")
+                    if stderr:
+                        print(stderr)
+                    if stdout:
+                        print(stdout)
+                    for f in output_dir_path.glob(f"{temp_name}*.png"):
+                        f.unlink(missing_ok=True)
+
+            # Fallback remoto si no hay Jar o el comando falló
+            remote_image = self._fetch_plantuml_image(plantuml_code, output_dir_path / f"{temp_name}_remote")
+            if remote_image:
+                temp_file.unlink(missing_ok=True)
+                return self._image_to_data_uri(remote_image)
+
+            temp_file.unlink(missing_ok=True)
+            return ""
+        except Exception as e:
+            print(f"[PlantUML Error] {e}")
+            return ""
 
     def generate(self) -> dict:
         return {
@@ -44,7 +267,16 @@ class DocGenerator:
         files  = self.r.get("total_files", 0)
         score  = self.r.get("quality_score", 0)
 
-        lang_table = "\n".join(f"| {l} | {c} archivos |" for l, c in langs.items())
+        lang_rows = [[l, f"{c} archivos"] for l, c in langs.items()]
+        metrics_rows = [
+            ["Total de archivos", str(files)],
+            ["Funciones", str(len(fns))],
+            ["Clases", str(len(cls))],
+            ["Endpoints API", str(len(eps))],
+            ["Score de calidad", f"{score}/100"],
+            ["Funciones documentadas", f"{sum(1 for f in fns if f.get('docstring'))} / {len(fns)}"],
+            ["Clases documentadas", f"{sum(1 for c in cls if c.get('docstring'))} / {len(cls)}"],
+        ]
 
         return f"""# Documentación del Proyecto
 
@@ -59,21 +291,11 @@ Este proyecto está desarrollado principalmente en **{lang}** y cuenta con
 
 ## Stack Tecnológico
 
-| Lenguaje | Cantidad |
-|----------|----------|
-{lang_table}
+{self._render_markdown_table(['Lenguaje', 'Cantidad'], lang_rows)}
 
 ## Estadísticas del Proyecto
 
-| Métrica | Valor |
-|---------|-------|
-| Total de archivos | {files} |
-| Funciones | {len(fns)} |
-| Clases | {len(cls)} |
-| Endpoints API | {len(eps)} |
-| Score de calidad | {score}/100 |
-| Funciones documentadas | {sum(1 for f in fns if f.get('docstring'))} / {len(fns)} |
-| Clases documentadas | {sum(1 for c in cls if c.get('docstring'))} / {len(cls)} |
+{self._render_markdown_table(['Métrica', 'Valor'], metrics_rows)}
 """
 
     # ─── 2. ARQUITECTURA ──────────────────────────────────────────────────────
@@ -107,35 +329,85 @@ Este proyecto está desarrollado principalmente en **{lang}** y cuenta con
             for l, c in sorted(langs.items(), key=lambda x: -x[1])
         )
 
-        # Diagrama de casos de uso inferido de endpoints
-        use_cases = ""
+        # Diagrama de casos de uso en PlantUML
+        use_cases_puml = "@startuml\n"
+        use_cases_puml += "actor Usuario as user\n"
+        use_cases_puml += "package \"Sistema\" {\n"
+        for ep in eps[:10]:
+            method = ep.get("method", "GET")
+            path = ep.get("path", "/").replace("/", "_").replace("{", "").replace("}", "")
+            use_cases_puml += f'  usecase "{method} {ep.get("path", "/")}" as uc_{path}\n'
+            use_cases_puml += f'  user --> uc_{path}\n'
+        if len(eps) > 10:
+            use_cases_puml += '  usecase "Otros endpoints" as uc_other\n'
+            use_cases_puml += '  user --> uc_other\n'
+        use_cases_puml += "}\n@enduml"
+        
+        # Generar diagrama de casos de uso
+        use_case_diagram = ""
         if eps:
-            use_cases = "```\n        [Usuario]\n"
-            for ep in eps[:8]:
-                method = ep.get("method", "GET")
-                path   = ep.get("path", "/")
-                use_cases += f"           │──── {method} {path}\n"
-            if len(eps) > 8:
-                use_cases += f"           │──── ... ({len(eps) - 8} más)\n"
-            use_cases += "           ▼\n      [Sistema API]\n```"
-        else:
-            use_cases = "```\n[Usuario] ──► [Sistema] ──► [Base de Datos]\n```"
+            diagram_path = self._generate_plantuml_diagram(use_cases_puml)
+            if diagram_path:
+                use_case_diagram = (
+                    f"\n\n<img src=\"{diagram_path}\" alt=\"Diagrama de Casos de Uso\" "
+                    f"style=\"max-width: 100%; height: auto; margin: 1rem 0; border: 1px solid #cbd5e1; border-radius: 8px;\">\n"
+                )
 
-        # Esquema de base de datos inferido de clases modelo
-        model_classes = [c for c in cls if any(
-            kw in c["name"].lower() for kw in ["model", "schema", "entity", "dto"]
-        )]
-        db_schema = ""
-        if model_classes:
-            db_schema = "**Entidades detectadas:**\n\n"
-            for m in model_classes[:6]:
-                methods = m.get("methods", [])
-                db_schema += f"- `{m['name']}` — {len(methods)} métodos"
-                if m.get("bases"):
-                    db_schema += f" | hereda: `{'`, `'.join(m['bases'])}`"
-                db_schema += "\n"
-        else:
-            db_schema = "No se detectaron clases de modelo explícitas. Las relaciones se infieren de los endpoints y funciones."
+        # Diagrama de infraestructura en PlantUML
+        infra_puml = """@startuml
+skinparam componentStyle rectangle
+package "Cliente / Frontend" {
+  [Navegador] as browser
+  [App Móvil] as mobile
+  [CLI] as cli
+}
+package "API / Backend" {
+  [Rutas] as routes
+  [Lógica de Negocio] as logic
+  routes --> logic
+}
+database "Base de Datos" as db
+database "Caché" as cache
+[Servicios Ext.] as ext
+logic --> db
+logic --> cache
+logic --> ext
+browser --> routes
+mobile --> routes
+cli --> routes
+@enduml"""
+        
+        # Generar diagrama de infraestructura
+        infra_diagram = ""
+        diagram_path = self._generate_plantuml_diagram(infra_puml)
+        if diagram_path:
+            infra_diagram = (
+                f"\n\n<img src=\"{diagram_path}\" alt=\"Diagrama de Infraestructura\" "
+                f"style=\"max-width: 100%; height: auto; margin: 1rem 0; border: 1px solid #cbd5e1; border-radius: 8px;\">\n"
+            )
+
+        # Diagrama de clases en PlantUML
+        class_puml = "@startuml\n"
+        for c in cls[:15]:
+            class_name = c.get("name", "Unknown")
+            class_puml += f'class "{class_name}" {{\n'
+            methods = c.get("methods", [])
+            for m in methods[:5]:
+                class_puml += f'  {m}\n'
+            if len(methods) > 5:
+                class_puml += f'  ... {len(methods) - 5} más\n'
+            class_puml += '}\n'
+        class_puml += "@enduml"
+        
+        # Generar diagrama de clases
+        class_diagram = ""
+        if cls:
+            diagram_path = self._generate_plantuml_diagram(class_puml)
+            if diagram_path:
+                class_diagram = (
+                    f"\n\n<img src=\"{diagram_path}\" alt=\"Diagrama de Clases\" "
+                    f"style=\"max-width: 100%; height: auto; margin: 1rem 0; border: 1px solid #cbd5e1; border-radius: 8px;\">\n"
+                )
 
         return f"""## 2. Documentación de Arquitectura y Diseño
 
@@ -156,65 +428,21 @@ proyecto/
 
 ### 2.4 Diagrama de Infraestructura
 
-```
-┌─────────────────────────────────────────────────┐
-│                  CLIENTE / FRONTEND              │
-│         (Navegador / App Móvil / CLI)            │
-└────────────────────┬────────────────────────────┘
-                     │  HTTPS / REST / WebSocket
-                     ▼
-┌─────────────────────────────────────────────────┐
-│                  API / BACKEND                   │
-│  ┌─────────────┐   ┌──────────────────────────┐ │
-│  │   Rutas     │──►│   Lógica de Negocio       │ │
-│  │  (Routes)   │   │   (Services / Controllers)│ │
-│  └─────────────┘   └──────────┬───────────────┘ │
-└─────────────────────────────────────────────────┘
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-             [Base de Datos] [Caché]   [Servicios Ext.]
-             (MongoDB/SQL)  (Redis)    (APIs terceros)
-```
+{infra_diagram}
 
 ### 2.5 Diagrama de Casos de Uso
 
-{use_cases}
+{use_case_diagram}
 
-### 2.6 Diagrama de Flujo del Sistema
+### 2.6 Diagrama de Clases
 
-```
-Usuario
-  │
-  ├─► Autenticación ──► JWT Token
-  │
-  ├─► Solicitud HTTP ──► Middleware (Auth/Logs)
-  │                          │
-  │                          ▼
-  │                    Enrutador (Router)
-  │                          │
-  │              ┌───────────┴───────────┐
-  │              ▼                       ▼
-  │        Controlador            Validación
-  │              │                       │
-  │              ▼                       │
-  │        Servicio/Lógica ◄─────────────┘
-  │              │
-  │              ▼
-  │        Base de Datos
-  │              │
-  └─◄─── Respuesta JSON
-```
+{class_diagram}
 
-### 2.7 Modelos de Datos
-
-{db_schema}
-
-### 2.8 Patrones Detectados
+### 2.7 Patrones Detectados
 
 {self._detect_patterns()}
 
-### 2.9 Insights de Arquitectura (IA)
+### 2.8 Insights de Arquitectura (IA)
 
 {ai_insights if ai_insights else "No se generaron insights de IA - configura OPENAI_API_KEY para habilitar esta función."}
 """
@@ -364,18 +592,17 @@ python app.py  # o npm run dev
         out += "### 3.4 Planes de Prueba (Testing)\n\n"
         if test_fns:
             out += f"Se detectaron **{len(test_fns)} funciones de prueba**:\n\n"
-            out += "| Función de Test | Archivo |\n|----------------|--------|\n"
-            for fn in test_fns[:10]:
-                out += f"| `{fn['name']}` | `{fn.get('file', '?')}` |\n"
-            out += "\n"
+            rows = [[f"`{fn['name']}`", f"`{fn.get('file', '?')}`"] for fn in test_fns[:10]]
+            out += self._render_markdown_table(['Función de Test', 'Archivo'], rows)
         else:
             out += "No se detectaron pruebas automatizadas. Se recomienda implementar:\n\n"
             out += "```python\n# Ejemplo de estructura de tests recomendada\nimport pytest\n\nclass TestEndpoints:\n    def test_get_returns_200(self, client):\n        response = client.get('/api/endpoint')\n        assert response.status_code == 200\n\n    def test_post_creates_resource(self, client):\n        data = {'name': 'test'}\n        response = client.post('/api/endpoint', json=data)\n        assert response.status_code == 201\n\n    def test_unauthorized_returns_401(self, client):\n        response = client.get('/api/protected')\n        assert response.status_code == 401\n```\n\n"
             out += "**Escenarios de prueba recomendados:**\n\n"
-            out += "| Escenario | Tipo | Prioridad |\n|-----------|------|-----------|\n"
+            rows = []
             for ep in eps[:6]:
-                out += f"| {ep.get('method')} {ep.get('path')} — respuesta 200 | Integración | Alta |\n"
-                out += f"| {ep.get('method')} {ep.get('path')} — sin auth (401) | Seguridad | Alta |\n"
+                rows.append([f"{ep.get('method')} {ep.get('path')} — respuesta 200", "Integración", "Alta"])
+                rows.append([f"{ep.get('method')} {ep.get('path')} — sin auth (401)", "Seguridad", "Alta"])
+            out += self._render_markdown_table(['Escenario', 'Tipo', 'Prioridad'], rows)
             out += "\n"
 
         return out
